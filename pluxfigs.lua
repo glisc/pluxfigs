@@ -11111,22 +11111,24 @@ function Library.CatalogData.Filter(records, category, query, order)
     return found
 end
 
-function Library.CatalogData.Page(records, page, pageSize)
-    pageSize = math.max(1, math.floor(tonumber(pageSize) or 12))
-    local pages = math.max(1, math.ceil(#records / pageSize))
-    page = math.clamp(math.floor(tonumber(page) or 1), 1, pages)
-    local found = {}
-    for index = (page - 1) * pageSize + 1, math.min(page * pageSize, #records) do
-        found[#found + 1] = records[index]
-    end
-    return found, page, pages
+-- Canvas covers every result; only nearby rows need GUI instances.
+function Library.CatalogData.Window(count, scroll, viewHeight, columns, rowHeight, gap)
+    count = math.max(0, math.floor(count))
+    columns = math.max(1, math.floor(columns))
+    local pitch = math.max(1, rowHeight + gap)
+    local rows = math.ceil(count / columns)
+    local height = math.max(0, rows * pitch - gap)
+    scroll = math.clamp(scroll, 0, math.max(0, height - viewHeight))
+    if count == 0 then return { First = 1, Last = 0, Height = 0, Scroll = 0 } end
+    local firstRow = math.max(0, math.floor(scroll / pitch) - 1)
+    local lastRow = math.min(rows - 1, math.floor((scroll + math.max(1, viewHeight) - 1) / pitch) + 1)
+    return { First = firstRow * columns + 1, Last = math.min(count, (lastRow + 1) * columns), Height = height, Scroll = scroll }
 end
 
 -- Selection is separate from application, including on touch screens.
 function Library.CatalogData.Controller(opts)
     local state = {
-        Records = {}, Category = "All", Query = "", Order = "Rarity", Page = 1,
-        PageSize = math.clamp(tonumber(opts.PageSize) or 18, 1, 36),
+        Records = {}, Category = "All", Query = "", Order = "Rarity",
         Selected = nil, Error = nil, Busy = false,
     }
     function state:_changed()
@@ -11135,7 +11137,7 @@ function Library.CatalogData.Controller(opts)
     function state:SetRecords(records)
         if self._destroyed then return false end
         local selected = self.Selected and self.Selected.Id
-        self.Records, self.Selected = {}, nil
+        self.Records, self.Selected, self._filtered = {}, nil, nil
         local hasCategory = self.Category == "All"
         for _, record in ipairs(type(records) == "table" and records or {}) do
             if type(record) ~= "table" or type(record.Id) ~= "string" or type(record.Name) ~= "string"
@@ -11154,15 +11156,15 @@ function Library.CatalogData.Controller(opts)
         self.Category = category or self.Category
         self.Query = query ~= nil and tostring(query) or self.Query
         self.Order = order or self.Order
-        self.Page, self.Selected, self.Error = 1, nil, nil
+        self.Selected, self.Error, self._filtered = nil, nil, nil
         self:_changed()
         return true
     end
-    function state:GetPage()
-        local filtered = Library.CatalogData.Filter(self.Records, self.Category, self.Query, self.Order)
-        local visible, page, pages = Library.CatalogData.Page(filtered, self.Page, self.PageSize)
-        self.Page = page
-        return visible, page, pages, #filtered
+    function state:GetResults()
+        if not self._filtered then
+            self._filtered = Library.CatalogData.Filter(self.Records, self.Category, self.Query, self.Order)
+        end
+        return self._filtered
     end
     function state:Select(record)
         if self._destroyed or self.Busy or not record then return false end
@@ -11212,108 +11214,193 @@ function Library.CatalogData.Controller(opts)
     end
     function state:Dispose()
         self._destroyed, self.Changed, self.Selected = true, nil, nil
-        self.Records = {}
+        self.Records, self._filtered = {}, nil
     end
     state:SetRecords(opts.Records)
     return state
 end
 
--- Pluxfigs catalog UI: bounded thumbnail pages and a separate image inspector.
+
+-- Pluxfigs catalog UI
+-- Original Pluxfigs line icons. GUI geometry, with no text glyph or image download.
+Library.CatalogIcons = {}
+function Library.CatalogIcons.Create(parent, name, size, color)
+    local paths, rings = {}, {}
+    if name == "Search" then
+        rings = {{10,10,6}} paths = {{{14.5,14.5},{20,20}}}
+    elseif name == "Sort" then
+        paths = {{{5,5},{5,19}},{{2,8},{5,5},{8,8}},{{12,6},{21,6}},{{12,12},{18,12}},{{12,18},{15,18}}}
+    elseif name == "Refresh" then
+        paths = {{{19,8},{16,4},{9,3},{4,7},{3,13},{6,19},{13,21},{19,17}},{{19,3},{19,8},{14,8}}}
+    elseif name == "Back" then
+        paths = {{{10,5},{3,12},{10,19}},{{3,12},{21,12}}}
+    elseif name == "Check" or name == "Equip" then
+        paths = {{{4,12},{9,17},{20,6}}}
+    elseif name == "Reset" then
+        paths = {{{5,8},{9,4},{16,4},{21,9},{20,16},{15,20},{8,19}},{{5,3},{5,8},{10,8}}}
+    elseif name == "Shuffle" then
+        paths = {{{3,6},{7,6},{17,18},{21,18}},{{3,18},{7,18},{17,6},{21,6}},{{18,3},{21,6},{18,9}},{{18,15},{21,18},{18,21}}}
+    elseif name == "Rarest" then
+        paths = {{{4,8},{8,3},{16,3},{20,8},{12,21},{4,8},{20,8}},{{8,3},{10,8},{12,21},{14,8},{16,3}}}
+    elseif name == "Knife" then
+        paths = {{{3,21},{9,15},{12,18}},{{7,12},{12,17}},{{8,13},{19,2},{21,3},{18,11},{12,17}}}
+    elseif name == "Gloves" then
+        paths = {{{6,21},{3,11},{5,9},{8,12},{7,4},{10,3},{12,10},{12,3},{15,3},{16,10},{17,5},{20,6},{20,16},{17,21},{6,21}}}
+    elseif name == "Weapon" then
+        paths = {{{2,7},{19,7},{21,9},{19,11},{13,11},{10,20},{5,20},{7,11},{2,11},{2,7}},{{12,12},{16,12},{15,15},{11,15}}}
+    elseif name == "Image" then
+        paths = {{{3,4},{21,4},{21,20},{3,20},{3,4}},{{3,17},{9,11},{14,16},{17,13},{21,17}}}
+        rings = {{16,8,1.5}}
+    elseif name == "Grid" then
+        paths = {{{3,3},{9,3},{9,9},{3,9},{3,3}},{{15,3},{21,3},{21,9},{15,9},{15,3}},{{3,15},{9,15},{9,21},{3,21},{3,15}},{{15,15},{21,15},{21,21},{15,21},{15,15}}}
+    else
+        paths = {{{3,5},{10,5},{10,10},{3,10},{3,5}},{{14,5},{21,5},{21,10},{14,10},{14,5}},{{3,14},{10,14},{10,19},{3,19},{3,14}},{{14,14},{21,14},{21,19},{14,19},{14,14}}}
+    end
+    local root = create("Frame", { Name = "PluxfigsIcon", Size = UDim2.fromOffset(size, size), BackgroundTransparency = 1, Active = false, Parent = parent })
+    local body = create("Frame", { Size = UDim2.fromOffset(24, 24), BackgroundTransparency = 1, Active = false, Parent = root })
+    create("UIScale", { Scale = size / 24, Parent = body })
+    local lines, strokes = {}, {}
+    for _, path in ipairs(paths) do
+        for index = 2, #path do
+            local a, b = path[index - 1], path[index]
+            local dx, dy = b[1] - a[1], b[2] - a[2]
+            local line = create("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromOffset((a[1] + b[1]) / 2, (a[2] + b[2]) / 2),
+                Size = UDim2.fromOffset(math.sqrt(dx * dx + dy * dy) + 0.5, 1.7), Rotation = math.deg(math.atan2(dy, dx)),
+                BackgroundColor3 = color, BorderSizePixel = 0, Active = false, Parent = body,
+            })
+            corner(line, UDim.new(1, 0))
+            lines[#lines + 1] = line
+        end
+    end
+    for _, ring in ipairs(rings) do
+        local circle = create("Frame", { Position = UDim2.fromOffset(ring[1] - ring[3], ring[2] - ring[3]), Size = UDim2.fromOffset(ring[3] * 2, ring[3] * 2), BackgroundTransparency = 1, Active = false, Parent = body })
+        corner(circle, UDim.new(1, 0))
+        strokes[#strokes + 1] = stroke(circle, color, 0, 1.7)
+    end
+    local icon = { Root = root }
+    function icon:SetColor(value)
+        for _, line in ipairs(lines) do tween(line, { BackgroundColor3 = value }, 0) end
+        for _, edge in ipairs(strokes) do tween(edge, { Color = value }, 0) end
+    end
+    return icon
+end
+
 function Tab:SkinCatalog(opts)
     opts = opts or {}
-    local window = self.Window
-    local data = Library.CatalogData
+    local window, data = self.Window, Library.CatalogData
     local handle = data.Controller(opts)
     local frame = create("Frame", {
-        Name = "SkinCatalog", Size = UDim2.new(1, 0, 0, 460),
-        BackgroundColor3 = Theme.Surface, BorderSizePixel = 0,
-        LayoutOrder = self:_nextOrder(), ClipsDescendants = true, Parent = self.List,
+        Name = "SkinCatalog", Size = UDim2.new(1, 0, 0, 480), BackgroundColor3 = Theme.Surface,
+        BorderSizePixel = 0, ClipsDescendants = true, LayoutOrder = self:_nextOrder(), Parent = self.List,
     })
     frame:SetAttribute("NoDrag", true)
-    corner(frame, UDim.new(0, 10))
-    stroke(frame, Theme.Stroke)
+    corner(frame, UDim.new(0, 12))
+    stroke(frame, Theme.Stroke, 0.35)
     local browse = create("Frame", { Name = "Browse", Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Parent = frame })
-    local function text(parent, name, value, x, y, width, height, size, muted)
-        return label({
-            Name = name, Text = value, Position = UDim2.fromOffset(x, y), Size = width or UDim2.new(1, -24, 0, height or 18),
-            TextSize = size or 13, TextColor3 = muted and Theme.Muted or Theme.Text, Parent = parent,
-        })
+    local function text(parent, name, value, position, size, fontSize, muted)
+        return label({ Name = name, Text = value, Position = position, Size = size, TextSize = fontSize or 12,
+            TextColor3 = muted and Theme.Muted or Theme.Text, Parent = parent })
     end
-    local function button(parent, name, value)
-        local object = create("TextButton", {
-            Name = name, Text = value, TextSize = 12, FontFace = Fonts.Medium,
-            TextColor3 = Theme.Text, BackgroundColor3 = Theme.Surface3,
-            BorderSizePixel = 0, AutoButtonColor = false, Parent = parent,
-        })
-        corner(object, UDim.new(0, 6))
-        return object
+    local function icon(parent, name, size, color, position)
+        local graphic = Library.CatalogIcons.Create(parent, name, size, color)
+        graphic.Root.Position = position or UDim2.fromOffset(0, 0)
+        return graphic
     end
-    text(browse, "CatalogTitle", opts.Name or "Skin collection", 14, 12, UDim2.new(1, -140, 0, 20), 20, 15).FontFace = Fonts.Bold
-    local countLabel = text(browse, "CatalogCount", "", 0, 16, UDim2.new(1, -14, 0, 16), 16, 11, true)
-    countLabel.TextXAlignment = Enum.TextXAlignment.Right
+    local function action(parent, name, caption, glyph)
+        local button = create("TextButton", { Name = name, Text = "", BackgroundColor3 = Theme.Surface2,
+            BorderSizePixel = 0, AutoButtonColor = false, Parent = parent })
+        corner(button, UDim.new(0, 7))
+        local graphic = icon(button, glyph, 16, Theme.Muted, UDim2.new(0, caption ~= "" and 12 or 10, 0.5, -8))
+        local title = text(button, "Caption", caption, UDim2.fromOffset(34, 0), UDim2.new(1, -40, 1, 0), 11)
+        title.FontFace = Fonts.Medium
+        button.MouseEnter:Connect(function() tween(button, { BackgroundColor3 = Theme.Surface3 }, 0.12) end)
+        button.MouseLeave:Connect(function() tween(button, { BackgroundColor3 = Theme.Surface2 }, 0.12) end)
+        return { Button = button, Label = title, Icon = graphic }
+    end
+    local plate = create("Frame", { Position = UDim2.fromOffset(12, 12), Size = UDim2.fromOffset(32, 32), BackgroundColor3 = Theme.AccentDark, BorderSizePixel = 0, Parent = browse })
+    corner(plate, UDim.new(0, 9))
+    icon(plate, "Grid", 20, Theme.Accent, UDim2.fromOffset(6, 6))
+    local heading = text(browse, "CatalogTitle", "Skin collection", UDim2.fromOffset(54, 10), UDim2.new(1, -214, 0, 20), 14)
+    heading.FontFace = Fonts.Bold
+    local countLabel = text(browse, "CatalogCount", "", UDim2.fromOffset(54, 31), UDim2.new(1, -214, 0, 15), 10, true)
+    local feature = opts.ToggleElement and opts.ToggleElement._frame
+    if feature then
+        feature.Parent, feature.LayoutOrder = browse, 0
+        feature.Position, feature.Size = UDim2.new(1, -148, 0, 9), UDim2.fromOffset(136, 38)
+        feature.BackgroundTransparency = 1
+        for _, child in ipairs(feature:GetChildren()) do
+            if child:IsA("UIStroke") then child.Transparency = 1 end
+        end
+    end
+    local searchWell = create("Frame", { Position = UDim2.fromOffset(12, 62), Size = UDim2.new(1, -144, 0, 36), BackgroundColor3 = Theme.Surface2, BorderSizePixel = 0, Parent = browse })
+    corner(searchWell, UDim.new(0, 7))
+    stroke(searchWell, Theme.Stroke, 0.45)
+    icon(searchWell, "Search", 16, Theme.Muted, UDim2.fromOffset(10, 10))
     local search = create("TextBox", {
-        Name = "Search", Position = UDim2.fromOffset(12, 48), Size = UDim2.new(1, -144, 0, 34),
-        BackgroundColor3 = Theme.Surface2, BorderSizePixel = 0,
-        Text = "", PlaceholderText = "Search skins or items...", ClearTextOnFocus = false,
-        TextColor3 = Theme.Text, PlaceholderColor3 = Theme.Muted, TextSize = 12,
-        FontFace = Fonts.Regular, TextXAlignment = Enum.TextXAlignment.Left, Parent = browse,
+        Name = "Search", Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0,
+        Text = "", PlaceholderText = "Search skins or items", ClearTextOnFocus = false,
+        TextColor3 = Theme.Text, PlaceholderColor3 = Theme.Muted, FontFace = Fonts.Regular,
+        TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left, Parent = searchWell,
     })
-    corner(search, UDim.new(0, 6))
-    padding(search, 10, 8)
-    stroke(search, Theme.Stroke)
-    local sortButton = button(browse, "Sort", "Rarity")
-    sortButton.Position, sortButton.Size = UDim2.new(1, -124, 0, 48), UDim2.fromOffset(68, 34)
-    local reloadButton = button(browse, "Reload", "↻")
-    reloadButton.Position, reloadButton.Size, reloadButton.TextSize = UDim2.new(1, -48, 0, 48), UDim2.fromOffset(36, 34), 20
+    padding(search, 36, 8)
+    local sortControl = action(browse, "Sort", "Rarity", "Sort")
+    sortControl.Button.Position, sortControl.Button.Size = UDim2.new(1, -124, 0, 62), UDim2.fromOffset(72, 36)
+    sortControl.Icon.Root.Position = UDim2.fromOffset(8, 10)
+    sortControl.Label.Position, sortControl.Label.Size = UDim2.fromOffset(28, 0), UDim2.new(1, -30, 1, 0)
+    local reloadControl = action(browse, "Reload", "", "Refresh")
+    reloadControl.Button.Position, reloadControl.Button.Size = UDim2.new(1, -48, 0, 62), UDim2.fromOffset(36, 36)
     local chips = create("ScrollingFrame", {
-        Name = "Categories", Position = UDim2.fromOffset(12, 94), Size = UDim2.new(1, -24, 0, 34),
-        BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 2,
-        ScrollBarImageColor3 = Theme.Accent, ScrollingDirection = Enum.ScrollingDirection.X,
-        CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.X, Parent = browse,
+        Name = "Categories", Position = UDim2.fromOffset(12, 110), Size = UDim2.new(1, -24, 0, 34),
+        BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 2, ScrollBarImageColor3 = Theme.Accent,
+        ScrollingDirection = Enum.ScrollingDirection.X, AutomaticCanvasSize = Enum.AutomaticSize.X, CanvasSize = UDim2.new(), Parent = browse,
     })
     create("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6), Parent = chips })
-    local resultLabel = text(browse, "ResultCount", "", 14, 138, UDim2.new(1, -28, 0, 16), 16, 11, true)
+    local resultLabel = text(browse, "ResultCount", "", UDim2.fromOffset(14, 153), UDim2.new(1, -28, 0, 16), 10, true)
     local results = create("ScrollingFrame", {
-        Name = "Results", Position = UDim2.fromOffset(12, 164), Size = UDim2.new(1, -24, 1, -212),
-        BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3,
-        ScrollBarImageColor3 = Theme.Accent, ScrollingDirection = Enum.ScrollingDirection.Y,
-        VerticalScrollBarInset = Enum.ScrollBarInset.ScrollBar,
-        CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, Parent = browse,
+        Name = "Results", Position = UDim2.fromOffset(12, 178), Size = UDim2.new(1, -24, 1, -234),
+        BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3, ScrollBarImageColor3 = Theme.Accent,
+        ScrollBarImageTransparency = 0.4, ScrollingDirection = Enum.ScrollingDirection.Y,
+        AutomaticCanvasSize = Enum.AutomaticSize.None, CanvasSize = UDim2.new(), Parent = browse,
     })
-    local grid = create("UIGridLayout", { CellSize = UDim2.new(0.5, -5, 0, 142), CellPadding = UDim2.fromOffset(10, 10), SortOrder = Enum.SortOrder.LayoutOrder, Parent = results })
-    local empty = text(browse, "Empty", "", 24, 182, UDim2.new(1, -48, 1, -238), 80, 13, true)
+    local empty = text(browse, "Empty", "", UDim2.fromOffset(24, 188), UDim2.new(1, -48, 1, -254), 12, true)
     empty.TextWrapped, empty.TextXAlignment, empty.TextYAlignment = true, Enum.TextXAlignment.Center, Enum.TextYAlignment.Center
-    local previous = button(browse, "PreviousPage", "‹ Previous")
-    previous.Position, previous.Size = UDim2.new(0, 12, 1, -38), UDim2.fromOffset(94, 28)
-    local nextButton = button(browse, "NextPage", "Next ›")
-    nextButton.Position, nextButton.Size = UDim2.new(1, -106, 1, -38), UDim2.fromOffset(94, 28)
-    local pageLabel = text(browse, "Page", "", 0, 0, UDim2.new(1, -224, 0, 28), 28, 11, true)
-    pageLabel.Position, pageLabel.TextXAlignment = UDim2.new(0, 112, 1, -38), Enum.TextXAlignment.Center
+    local footer = create("Frame", { Position = UDim2.new(0, 12, 1, -44), Size = UDim2.new(1, -24, 0, 32), BackgroundTransparency = 1, Parent = browse })
+    local actions = {}
+    for index, spec in ipairs(opts.Actions or {}) do
+        local control = action(footer, "BatchAction", spec.Name, spec.Icon)
+        local count = math.max(1, #opts.Actions)
+        control.Button.Position = UDim2.new((index - 1) / count, (index - 1) * 6 / count, 0, 0)
+        control.Button.Size = UDim2.new(1 / count, -6 * (count - 1) / count, 1, 0)
+        if spec.Danger then tween(control.Label, { TextColor3 = Theme.Error }, 0) control.Icon:SetColor(Theme.Error) end
+        control.Button.Activated:Connect(function() safeCall(spec.Callback) end)
+        actions[#actions + 1] = { Control = control, Danger = spec.Danger }
+    end
 
-    local preview = create("Frame", { Name = "Preview", Visible = false, Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Active = true, Parent = frame })
-    local backButton = button(preview, "Back", "‹ Back to catalog")
-    backButton.Position, backButton.Size = UDim2.fromOffset(12, 12), UDim2.fromOffset(150, 30)
-    local imageWell = create("Frame", { Name = "ImageWell", Position = UDim2.fromOffset(12, 54), Size = UDim2.new(1, -24, 1, -220), BackgroundColor3 = Theme.Surface2, BorderSizePixel = 0, Parent = preview })
-    corner(imageWell, UDim.new(0, 8))
-    local largeImage = create("ImageLabel", { Name = "SkinImage", Position = UDim2.fromOffset(14, 10), Size = UDim2.new(1, -28, 1, -20), BackgroundTransparency = 1, Image = "", ImageColor3 = Color3.new(1, 1, 1), ScaleType = Enum.ScaleType.Fit, Parent = imageWell })
-    local imageStatus = text(imageWell, "ImageStatus", "", 10, 0, UDim2.new(1, -20, 1, 0), 30, 13, true)
-    imageStatus.TextXAlignment, imageStatus.TextYAlignment = Enum.TextXAlignment.Center, Enum.TextYAlignment.Center
-    local skinName = text(preview, "SkinName", "", 16, 0, UDim2.new(1, -32, 0, 38), 38, 17)
-    skinName.Position, skinName.FontFace, skinName.TextWrapped = UDim2.new(0, 16, 1, -156), Fonts.Bold, true
-    local itemName = text(preview, "ItemName", "", 16, 0, UDim2.new(1, -32, 0, 20), 20, 12, true)
-    itemName.Position = UDim2.new(0, 16, 1, -112)
-    local actionStatus = text(preview, "ActionStatus", "", 16, 0, UDim2.new(1, -32, 0, 28), 28, 11, true)
-    actionStatus.Position, actionStatus.TextWrapped = UDim2.new(0, 16, 1, -88), true
-    local equipButton = button(preview, "Equip", "Equip skin")
-    equipButton.Position, equipButton.Size = UDim2.new(0, 12, 1, -48), UDim2.new(0.55, -18, 0, 36)
-    local resetButton = button(preview, "Restore", "Restore original")
-    resetButton.Position, resetButton.Size = UDim2.new(0.55, 0, 1, -48), UDim2.new(0.45, -12, 0, 36)
+    local preview = create("Frame", { Name = "Preview", Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Visible = false, Parent = frame })
+    local backControl = action(preview, "Back", "Collection", "Back")
+    backControl.Button.Position, backControl.Button.Size = UDim2.fromOffset(12, 12), UDim2.fromOffset(122, 32)
+    local rarityLabel = text(preview, "Rarity", "", UDim2.new(1, -152, 0, 12), UDim2.fromOffset(140, 32), 11, true)
+    rarityLabel.TextXAlignment = Enum.TextXAlignment.Right
+    local imageWell = create("Frame", { Name = "ImageWell", Position = UDim2.fromOffset(12, 56), Size = UDim2.new(1, -24, 1, -202), BackgroundColor3 = Theme.Surface2, BorderSizePixel = 0, Parent = preview })
+    corner(imageWell, UDim.new(0, 10))
+    local largeImage = create("ImageLabel", { Name = "SkinImage", Position = UDim2.fromOffset(20, 20), Size = UDim2.new(1, -40, 1, -40), BackgroundTransparency = 1,
+        Image = "", ImageColor3 = Color3.new(1, 1, 1), ScaleType = Enum.ScaleType.Fit, Parent = imageWell })
+    local missingImage = icon(imageWell, "Image", 36, Theme.Muted, UDim2.new(0.5, -18, 0.5, -18))
+    local skinName = text(preview, "SkinName", "", UDim2.new(0, 16, 1, -134), UDim2.new(1, -32, 0, 30), 18)
+    skinName.FontFace = Fonts.Bold
+    local itemName = text(preview, "ItemName", "", UDim2.new(0, 16, 1, -102), UDim2.new(1, -32, 0, 18), 12, true)
+    local actionStatus = text(preview, "ActionStatus", "", UDim2.new(0, 16, 1, -80), UDim2.new(1, -32, 0, 24), 10, true)
+    actionStatus.TextWrapped = true
+    local equipControl = action(preview, "Equip", "Equip skin", "Equip")
+    equipControl.Button.Position, equipControl.Button.Size = UDim2.new(0, 12, 1, -48), UDim2.new(0.55, -18, 0, 36)
+    local resetControl = action(preview, "Restore", "Restore original", "Reset")
+    resetControl.Button.Position, resetControl.Button.Size = UDim2.new(0.55, 0, 1, -48), UDim2.new(0.45, -12, 0, 36)
 
-    local tiles, categoryButtons = {}, {}
-    local chipSignature, pageSignature = nil, nil
-    local imageGeneration = 0
-    local shownImage, shownRecord = nil, nil
-    local pages = 1
+    local filtered, rows, categories = {}, {}, {}
+    local categorySignature = nil
+    local columns, tileWidth, rowHeight, gap = 3, 164, 142, 10
+    local drawing = false
     local function equipped(record)
         if type(opts.IsEquipped) ~= "function" then return false end
         local ok, value = pcall(opts.IsEquipped, record)
@@ -11322,186 +11409,211 @@ function Tab:SkinCatalog(opts)
     local function colorOf(record)
         return typeof(record.Color) == "Color3" and record.Color or Theme.Accent
     end
-    local function showImage(image, fallback, value, large)
+    local function showImage(image, placeholder, value)
+        -- No loading label, timeout, or IsLoaded dependency can cover a skin.
         local asset = data.Image(value)
         image.Image, image.Visible = asset or "", asset ~= nil
-        fallback.Text, fallback.Visible = asset and "Loading image..." or "Preview unavailable", true
-        local function loaded()
-            if handle._destroyed or not image.Parent then return end
-            if image.Image == (asset or "") and image.IsLoaded and asset then fallback.Visible = false end
-        end
-        local connection = image:GetPropertyChangedSignal("IsLoaded"):Connect(loaded)
-        loaded()
-        if large then
-            imageGeneration += 1
-            local generation = imageGeneration
-            task.delay(6, function()
-                if not handle._destroyed and generation == imageGeneration and image.Parent and fallback.Visible then
-                    fallback.Text = "Preview unavailable"
-                end
-            end)
-        elseif asset then
-            task.delay(6, function()
-                if not handle._destroyed and image.Parent and image.Image == asset and not image.IsLoaded then fallback.Text = "Preview unavailable" end
-            end)
-        end
-        return connection
+        placeholder.Root.Visible = asset == nil
     end
-    local largeConnection
     local function updatePreview()
         local record = handle.Selected
         browse.Visible, preview.Visible = record == nil, record ~= nil
-        if not record then
-            if largeConnection then largeConnection:Disconnect() largeConnection = nil end
-            largeImage.Image, shownImage, shownRecord = "", nil, nil
-            imageGeneration += 1
-            return
-        end
-        if record.Id ~= shownRecord or record.Image ~= shownImage then
-            if largeConnection then largeConnection:Disconnect() end
-            shownRecord, shownImage = record.Id, record.Image
-            largeConnection = showImage(largeImage, imageStatus, record.Image, true)
-        end
+        if not record then largeImage.Image = "" return end
+        showImage(largeImage, missingImage, record.Image)
+        skinName.Text, itemName.Text, rarityLabel.Text = record.Name, record.Item, record.Rarity or "Unranked"
+        tween(rarityLabel, { TextColor3 = colorOf(record) }, 0)
         local active = equipped(record)
-        skinName.Text, itemName.Text = record.Name, record.Item .. "  ·  " .. (record.Rarity or "Unranked")
-        tween(itemName, { TextColor3 = colorOf(record) }, 0)
-        actionStatus.Text = handle.Error or (active and "Equipped on your local view" or "Preview only. Equip to apply this skin.")
+        actionStatus.Text = handle.Error or (active and "Applied to your local view" or "")
         tween(actionStatus, { TextColor3 = handle.Error and Theme.Error or Theme.Muted }, 0)
-        equipButton.Text = handle.Busy and "Applying..." or active and "Equipped ✓" or "Equip skin"
-        equipButton.Active, resetButton.Active, backButton.Active = not handle.Busy and not active, not handle.Busy, not handle.Busy
-        tween(equipButton, { BackgroundColor3 = active and Theme.AccentDark or Theme.Accent, TextColor3 = active and Theme.Accent or Theme.Background }, 0)
-        resetButton.BackgroundColor3 = Theme.Surface3
+        equipControl.Label.Text = handle.Busy and "Applying" or active and "Equipped" or "Equip skin"
+        equipControl.Button.Active = not handle.Busy and not active
+        resetControl.Button.Active, backControl.Button.Active = not handle.Busy, not handle.Busy
+        tween(equipControl.Button, { BackgroundColor3 = active and Theme.AccentDark or Theme.Accent }, 0)
+        tween(equipControl.Label, { TextColor3 = active and Theme.Accent or Theme.Background }, 0)
+        equipControl.Icon:SetColor(active and Theme.Accent or Theme.Background)
     end
     local function paint()
-        for category, object in pairs(categoryButtons) do
-            tween(object, { BackgroundColor3 = category == handle.Category and Theme.AccentDark or Theme.Surface2, TextColor3 = category == handle.Category and Theme.Accent or Theme.Muted }, 0)
+        for category, control in pairs(categories) do
+            local active = category == handle.Category
+            tween(control.Button, { BackgroundColor3 = active and Theme.AccentDark or Theme.Surface2 }, 0)
+            tween(control.Label, { TextColor3 = active and Theme.Accent or Theme.Muted }, 0)
+            control.Icon:SetColor(active and Theme.Accent or Theme.Muted)
         end
-        for _, tile in ipairs(tiles) do
+        for _, tile in pairs(rows) do
             local active = equipped(tile.Record)
             tile.Badge.Visible = active
-            tween(tile.Badge, { BackgroundColor3 = Theme.AccentDark, TextColor3 = Theme.Accent }, 0)
-            tween(tile.Stroke, { Color = active and Theme.Accent or Theme.Stroke }, 0)
-            tile.Rarity.BackgroundColor3 = colorOf(tile.Record)
+            tween(tile.Edge, { Color = active and Theme.Accent or Theme.Stroke }, 0)
+            tween(tile.Rarity, { BackgroundColor3 = colorOf(tile.Record) }, 0)
+            tile.Check:SetColor(Theme.Accent)
+        end
+        for _, entry in ipairs(actions) do
+            entry.Control.Icon:SetColor(entry.Danger and Theme.Error or Theme.Muted)
         end
         updatePreview()
     end
-    local function rebuildCategories()
-        local names, seen = { "All" }, { All = true }
-        local function add(name)
-            if not seen[name] then names[#names + 1], seen[name] = name, true end
-        end
-        for _, category in ipairs(opts.CategoryOrder or {}) do
-            for _, record in ipairs(handle.Records) do if record.Category == category then add(category) break end end
-        end
-        local extra = {}
-        for _, record in ipairs(handle.Records) do
-            if not seen[record.Category] then extra[#extra + 1] = record.Category seen[record.Category] = true end
-        end
-        table.sort(extra)
-        for _, name in ipairs(extra) do names[#names + 1] = name end
-        local signature = table.concat(names, "\n")
-        if signature == chipSignature then return end
-        chipSignature = signature
-        for _, object in pairs(categoryButtons) do object:Destroy() end
-        categoryButtons = {}
-        for index, category in ipairs(names) do
-            local object = button(chips, category, category == "All" and "All items" or (opts.CategoryLabels or {})[category] or category)
-            object.AutomaticSize, object.Size, object.LayoutOrder = Enum.AutomaticSize.X, UDim2.fromOffset(0, 28), index
-            padding(object, 12, 12)
-            object.Activated:Connect(function() handle:SetFilter(category, nil, nil) results.CanvasPosition = Vector2.zero end)
-            categoryButtons[category] = object
+    -- A gesture remains a drag after moving back or bouncing at a boundary.
+    local gesture = nil
+    local function trackScroll(scroller)
+        if gesture and gesture.Scroller == scroller and (scroller.CanvasPosition - gesture.Canvas).Magnitude > 4 then
+            gesture.Moved = true
         end
     end
-    local function rebuildTiles(visible)
-        for _, tile in ipairs(tiles) do tile.Frame:Destroy() end
-        tiles = {}
-        for index, record in ipairs(visible) do
-            local object = button(results, "SkinCard", "")
-            object.LayoutOrder, object.BackgroundColor3 = index, Theme.Surface2
-            local edge = stroke(object, Theme.Stroke)
-            local rarity = create("Frame", { Position = UDim2.new(0, 0, 1, -3), Size = UDim2.new(1, 0, 0, 3), BackgroundColor3 = colorOf(record), BorderSizePixel = 0, Parent = object })
-            local image = create("ImageLabel", { Position = UDim2.fromOffset(8, 12), Size = UDim2.new(1, -16, 0, 77), BackgroundTransparency = 1, ImageColor3 = Color3.new(1, 1, 1), ScaleType = Enum.ScaleType.Fit, Parent = object })
-            local fallback = text(object, "ImageStatus", "", 8, 26, UDim2.new(1, -16, 0, 50), 50, 10, true)
-            fallback.TextWrapped, fallback.TextXAlignment = true, Enum.TextXAlignment.Center
-            showImage(image, fallback, record.Image, false)
-            text(object, "SkinName", record.Name, 10, 96, UDim2.new(1, -20, 0, 18), 18, 12)
-            text(object, "ItemName", record.Item, 10, 116, UDim2.new(1, -20, 0, 14), 14, 10, true)
-            local badge = text(object, "EquippedBadge", "✓", 0, 0, UDim2.fromOffset(20, 20), 20, 12)
-            badge.BackgroundTransparency, badge.TextXAlignment = 0, Enum.TextXAlignment.Center
-            corner(badge, UDim.new(0, 5))
-            badge.Position, badge.Size, badge.Active = UDim2.new(1, -26, 0, 6), UDim2.fromOffset(20, 20), false
-            badge.Selectable = false
-            object.MouseEnter:Connect(function() tween(object, { BackgroundColor3 = Theme.Surface3 }, 0.12) end)
-            object.MouseLeave:Connect(function() tween(object, { BackgroundColor3 = Theme.Surface2 }, 0.12) end)
-            object.Activated:Connect(function() handle:Select(record) end)
-            tiles[#tiles + 1] = { Frame = object, Stroke = edge, Badge = badge, Rarity = rarity, Record = record }
+    local inputDisconnect = window:_listen("Changed", function(input)
+        if not gesture then return end
+        local mouseMove = gesture.Input.UserInputType == Enum.UserInputType.MouseButton1
+            and input.UserInputType == Enum.UserInputType.MouseMovement
+        if input == gesture.Input or mouseMove then
+            local dx, dy = input.Position.X - gesture.X, input.Position.Y - gesture.Y
+            if dx * dx + dy * dy > 36 then gesture.Moved = true end
+        end
+    end)
+    local function tapOnly(button, scroller)
+        button.InputBegan:Connect(function(input)
+            if isPress(input) then
+                gesture = { Button = button, Scroller = scroller, Input = input, X = input.Position.X,
+                    Y = input.Position.Y, Canvas = scroller.CanvasPosition, Moved = false }
+            end
+        end)
+        return function()
+            if gesture and gesture.Button == button then
+                trackScroll(scroller)
+                local accepted = not gesture.Moved
+                gesture = nil
+                return accepted
+            end
+            return true
+        end
+    end
+    local function makeTile(record)
+        local object = create("TextButton", { Name = "SkinCard", Text = "", BackgroundColor3 = Theme.Surface2, BorderSizePixel = 0, AutoButtonColor = false, ClipsDescendants = true, Parent = results })
+        object:SetAttribute("RecordId", record.Id)
+        corner(object, UDim.new(0, 8))
+        local edge = stroke(object, Theme.Stroke, 0.35)
+        local rarity = create("Frame", { Position = UDim2.fromOffset(0, 10), Size = UDim2.new(0, 2, 1, -20), BackgroundColor3 = colorOf(record), BorderSizePixel = 0, Parent = object })
+        corner(rarity, UDim.new(1, 0))
+        local image = create("ImageLabel", { Position = UDim2.fromOffset(10, 10), Size = UDim2.new(1, -20, 1, -57), BackgroundTransparency = 1,
+            ImageColor3 = Color3.new(1, 1, 1), ScaleType = Enum.ScaleType.Fit, Parent = object })
+        local missing = icon(object, "Image", 22, Theme.Muted, UDim2.new(0.5, -11, 0.34, -11))
+        showImage(image, missing, record.Image)
+        local title = text(object, "SkinName", record.Name, UDim2.new(0, 12, 1, -42), UDim2.new(1, -24, 0, 17), 12)
+        title.FontFace = Fonts.Medium
+        text(object, "ItemName", record.Item, UDim2.new(0, 12, 1, -23), UDim2.new(1, -24, 0, 14), 10, true)
+        local badge = create("Frame", { Name = "EquippedBadge", Position = UDim2.new(1, -30, 0, 8), Size = UDim2.fromOffset(22, 22), BackgroundColor3 = Theme.AccentDark, BorderSizePixel = 0, Parent = object })
+        corner(badge, UDim.new(0, 6))
+        local check = icon(badge, "Check", 14, Theme.Accent, UDim2.fromOffset(4, 4))
+        local isTap = tapOnly(object, results)
+        object.Activated:Connect(function() if isTap() then handle:Select(record) end end)
+        object.MouseEnter:Connect(function() tween(object, { BackgroundColor3 = Theme.Surface3 }, 0.12) end)
+        object.MouseLeave:Connect(function() tween(object, { BackgroundColor3 = Theme.Surface2 }, 0.12) end)
+        return { Frame = object, Record = record, Edge = edge, Rarity = rarity, Badge = badge, Check = check }
+    end
+    local function drawRows()
+        if handle._destroyed or drawing then return end
+        drawing = true
+        local scale = math.max(window.Scale.Scale, 0.01)
+        local viewHeight = math.max(1, results.AbsoluteWindowSize.Y / scale)
+        local range = data.Window(#filtered, results.CanvasPosition.Y, viewHeight, columns, rowHeight, gap)
+        results.CanvasSize = UDim2.fromOffset(0, range.Height)
+        if results.CanvasPosition.Y ~= range.Scroll then results.CanvasPosition = Vector2.new(0, range.Scroll) end
+        for index, tile in pairs(rows) do
+            if index < range.First or index > range.Last then tile.Frame:Destroy() rows[index] = nil end
+        end
+        for index = range.First, range.Last do
+            local tile = rows[index]
+            if not tile then tile = makeTile(filtered[index]) rows[index] = tile end
+            local zero = index - 1
+            tile.Frame.Position = UDim2.fromOffset((zero % columns) * (tileWidth + gap), math.floor(zero / columns) * (rowHeight + gap))
+            tile.Frame.Size = UDim2.fromOffset(tileWidth, rowHeight)
+        end
+        drawing = false
+        paint()
+    end
+    local function categoryGlyph(category)
+        if category == "Knives" then return "Knife" elseif category == "Gloves" then return "Gloves"
+        elseif category == "All" then return "Grid" else return "Weapon" end
+    end
+    local function rebuildCategories()
+        local names, seen = { "All" }, { All = true }
+        local available = {}
+        for _, record in ipairs(handle.Records) do available[record.Category] = true end
+        for _, category in ipairs(opts.CategoryOrder or {}) do
+            if available[category] and not seen[category] then names[#names + 1] = category seen[category] = true end
+        end
+        local extras = {}
+        for category in pairs(available) do if not seen[category] then extras[#extras + 1] = category end end
+        table.sort(extras)
+        for _, category in ipairs(extras) do names[#names + 1] = category end
+        local signature = table.concat(names, "\n")
+        if signature == categorySignature then return end
+        categorySignature = signature
+        for _, control in pairs(categories) do control.Button:Destroy() end
+        categories = {}
+        for index, category in ipairs(names) do
+            local button = create("TextButton", { Name = "Category", Text = "", Size = UDim2.fromOffset(0, 30), AutomaticSize = Enum.AutomaticSize.X,
+                BackgroundColor3 = Theme.Surface2, BorderSizePixel = 0, AutoButtonColor = false, LayoutOrder = index, Parent = chips })
+            corner(button, UDim.new(0, 6))
+            padding(button, 10, 10)
+            create("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, VerticalAlignment = Enum.VerticalAlignment.Center, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 6), Parent = button })
+            local graphic = icon(button, categoryGlyph(category), 15, Theme.Muted)
+            graphic.Root.LayoutOrder = 1
+            local name = category == "All" and "All items" or (opts.CategoryLabels or {})[category] or category
+            local title = text(button, "CategoryName", name, UDim2.new(), UDim2.fromOffset(0, 30), 11, true)
+            title.AutomaticSize, title.LayoutOrder = Enum.AutomaticSize.X, 2
+            local isTap = tapOnly(button, chips)
+            button.Activated:Connect(function() if isTap() then handle:SetFilter(category, nil, nil) end end)
+            categories[category] = { Button = button, Label = title, Icon = graphic }
         end
     end
     local function render()
         if handle._destroyed then return end
-        local visible, page, pageCount, total = handle:GetPage()
-        pages = pageCount
-        countLabel.Text = tostring(#handle.Records) .. " skins"
-        sortButton.Text = handle.Order == "Name" and "A–Z" or "Rarity"
-        resultLabel.Text = handle.Error and not handle.Selected and handle.Error or tostring(total) .. " results  ·  Select a skin to inspect"
-        tween(resultLabel, { TextColor3 = handle.Error and Theme.Error or Theme.Muted }, 0)
-        pageLabel.Text = tostring(page) .. " / " .. tostring(pages)
-        previous.Active, nextButton.Active = page > 1, page < pages
-        previous.TextTransparency, nextButton.TextTransparency = page > 1 and 0 or 0.6, page < pages and 0 or 0.6
-        reloadButton.Active = not handle.Busy
-        empty.Visible = total == 0
-        empty.Text = #handle.Records == 0 and "No skins available yet.\nRefresh after the game finishes loading." or "No skins match your search.\nTry another name or category."
-        rebuildCategories()
-        local keys = { tostring(page), handle.Category, handle.Query, handle.Order }
-        for _, record in ipairs(visible) do keys[#keys + 1] = record.Id end
-        local signature = table.concat(keys, "\0")
-        if signature ~= pageSignature then
-            pageSignature = signature
-            rebuildTiles(visible)
+        local nextRecords = handle:GetResults()
+        if nextRecords ~= filtered then
+            filtered = nextRecords
+            for _, tile in pairs(rows) do tile.Frame:Destroy() end
+            rows = {}
+            results.CanvasPosition = Vector2.zero
         end
-        paint()
+        countLabel.Text = tostring(#handle.Records) .. " finishes"
+        sortControl.Label.Text = handle.Order == "Name" and "Name" or "Rarity"
+        resultLabel.Text = handle.Error and not handle.Selected and handle.Error or tostring(#filtered) .. " results"
+        tween(resultLabel, { TextColor3 = handle.Error and Theme.Error or Theme.Muted }, 0)
+        reloadControl.Button.Active = not handle.Busy
+        empty.Visible = #filtered == 0
+        empty.Text = #handle.Records == 0 and "The collection is empty. Refresh after the game loads." or "No matching skins. Try another item or category."
+        rebuildCategories()
+        drawRows()
     end
     local function resize()
         if handle._destroyed or not frame.Parent then return end
         local scale = math.max(window.Scale.Scale, 0.01)
-        local width = results.AbsoluteSize.X / scale
-        local columns = math.clamp(math.floor((width + 10) / 144), 2, 5)
-        if width > 0 and width < 230 then columns = 1 end
-        grid.CellSize = UDim2.new(1 / columns, -10 * (columns - 1) / columns, 0, 142)
+        local width = math.max(1, results.AbsoluteSize.X / scale - 7)
+        columns = math.clamp(math.floor((width + gap) / 154), 1, 5)
+        tileWidth = (width - gap * (columns - 1)) / columns
+        rowHeight = math.clamp(math.floor(tileWidth * 0.84), 132, 174)
         local height = self.List.AbsoluteWindowSize.Y / scale
-        if height > 0 then frame.Size = UDim2.new(1, 0, 0, math.clamp(height - 68, 380, 650)) end
+        if height > 0 then frame.Size = UDim2.new(1, 0, 0, math.clamp(height - 26, 360, 900)) end
+        heading.Text = width < 380 and "Skins" or "Skin collection"
+        drawRows()
     end
     handle.Changed = render
-    local originalSetRecords = handle.SetRecords
-    function handle:SetRecords(records)
-        pageSignature, chipSignature = nil, nil
-        return originalSetRecords(self, records)
-    end
-    search:GetPropertyChangedSignal("Text"):Connect(function()
-        handle:SetFilter(nil, search.Text, nil)
-        results.CanvasPosition = Vector2.zero
+    search:GetPropertyChangedSignal("Text"):Connect(function() handle:SetFilter(nil, search.Text, nil) end)
+    sortControl.Button.Activated:Connect(function() handle:SetFilter(nil, nil, handle.Order == "Name" and "Rarity" or "Name") end)
+    reloadControl.Button.Activated:Connect(function() handle:Reload() end)
+    backControl.Button.Activated:Connect(function() handle:Back() end)
+    equipControl.Button.Activated:Connect(function()
+        if handle.Selected and not equipped(handle.Selected) then handle:Apply(false) end
     end)
-    sortButton.Activated:Connect(function() handle:SetFilter(nil, nil, handle.Order == "Name" and "Rarity" or "Name") results.CanvasPosition = Vector2.zero end)
-    reloadButton.Activated:Connect(function() handle:Reload() end)
-    previous.Activated:Connect(function()
-        if handle.Page > 1 then handle.Page -= 1 results.CanvasPosition = Vector2.zero handle:Refresh() end
-    end)
-    nextButton.Activated:Connect(function()
-        if handle.Page < pages then handle.Page += 1 results.CanvasPosition = Vector2.zero handle:Refresh() end
-    end)
-    backButton.Activated:Connect(function() handle:Back() end)
-    equipButton.Activated:Connect(function()
-        if not handle.Selected or equipped(handle.Selected) then return end
-        handle:Apply(false)
-    end)
-    resetButton.Activated:Connect(function() handle:Apply(true) end)
+    resetControl.Button.Activated:Connect(function() handle:Apply(true) end)
+    results:GetPropertyChangedSignal("CanvasPosition"):Connect(function() trackScroll(results) drawRows() end)
+    chips:GetPropertyChangedSignal("CanvasPosition"):Connect(function() trackScroll(chips) end)
+    results:GetPropertyChangedSignal("AbsoluteWindowSize"):Connect(resize)
     results:GetPropertyChangedSignal("AbsoluteSize"):Connect(resize)
     local sizeConnection = self.List:GetPropertyChangedSignal("AbsoluteWindowSize"):Connect(resize)
     local scaleConnection = window.Scale:GetPropertyChangedSignal("Scale"):Connect(resize)
     frame.Destroying:Connect(function()
-        sizeConnection:Disconnect()
-        scaleConnection:Disconnect()
-        if largeConnection then largeConnection:Disconnect() end
+        sizeConnection:Disconnect() scaleConnection:Disconnect()
+        inputDisconnect() gesture = nil
+        if opts.ToggleElement and type(opts.ToggleElement.Destroy) == "function" then opts.ToggleElement:Destroy() end
         handle:Dispose()
     end)
     onTheme(frame, paint)
@@ -11511,7 +11623,6 @@ function Tab:SkinCatalog(opts)
 end
 
 Tab.CreateSkinCatalog = Tab.SkinCatalog
-
 
 -- Table: rows under a header, sortable by clicking a column. Rank = true adds
 -- a # column with medals for the top three, for leaderboards.
@@ -22944,38 +23055,38 @@ function xDTaraZ.UI.BuildSkins(window)
     local skins = xDTaraZ.Skins
     local tab = window:CreateTab({ Name = T("Skins", "สกิน"), Icon = "sparkles", Desc = T("Browse, preview and equip your skins", "ดูตัวอย่างและเลือกสกิน") })
     local toggle = xDTaraZ.UI.Toggle(tab, "SkinChanger", {
-        Name = T("Skin changer", "เปลี่ยนสกิน"),
-        Desc = T("Your chosen skins appear only on your screen", "สกินที่เลือกจะแสดงเฉพาะบนหน้าจอคุณ"),
+        Name = T("Enabled", "เปิดใช้งาน"),
     })
+    toggle.Name = "Skin changer"
     local labels = {}
     for category, title in pairs(skinTitles) do labels[category] = T(title[1], title[2]) end
     xDTaraZ.UI.SkinCatalog = tab:CreateSkinCatalog({
         Name = T("Skin collection", "คลังสกิน"),
         Records = skins.Records(), CategoryOrder = xDTaraZ.Config.SkinOrder, CategoryLabels = labels,
-        PageSize = 18,
+        ToggleElement = toggle.Element,
         IsEquipped = function(record) return xDTaraZ.Options.SkinChanger == true and skins.IsEquipped(record) end,
         OnEquip = function(record) return xDTaraZ.UI.ApplySkinRecord(record, false) end,
         OnReset = function(record) return xDTaraZ.UI.ApplySkinRecord(record, true) end,
         OnReload = function() skins.Build() return skins.Records() end,
-    })
-    -- Option bindings are registered after the tabs; refresh after their dispatch.
-    toggle:OnChanged(function() task.defer(xDTaraZ.UI.SyncSkins) end)
-    tab:CreateButtonRow({
-        { Name = T("Rarest", "หายากสุด"), Callback = xDTaraZ.UI.Detach(function()
+        Actions = {
+        { Name = T("Rarest", "หายากสุด"), Icon = "Rarest", Callback = xDTaraZ.UI.Detach(function()
             local count = skins.SetAll(function(list) return list[1] end)
             xDTaraZ.UI.SyncSkins()
             xDTaraZ.UI.Notify("Skins", "Set " .. count .. " items", 3, "Success")
         end) },
-        { Name = T("Random", "สุ่ม"), Callback = xDTaraZ.UI.Detach(function()
+        { Name = T("Random", "สุ่ม"), Icon = "Shuffle", Callback = xDTaraZ.UI.Detach(function()
             skins.SetAll(function(list) return list[math.random(#list)] end)
             xDTaraZ.UI.SyncSkins()
         end) },
-        { Name = T("Reset all", "ล้างทั้งหมด"), Style = "Danger", Callback = xDTaraZ.UI.Detach(function()
+        { Name = T("Reset", "ล้างทั้งหมด"), Icon = "Reset", Danger = true, Callback = xDTaraZ.UI.Detach(function()
             table.clear(skins.Map)
             skins.Save()
             xDTaraZ.UI.SyncSkins()
         end) },
+        },
     })
+    -- Option bindings are registered after the tabs; refresh after their dispatch.
+    toggle:OnChanged(function() task.defer(xDTaraZ.UI.SyncSkins) end)
 end
 
 function xDTaraZ.UI.BuildMisc(window)
